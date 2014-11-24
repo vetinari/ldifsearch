@@ -18,7 +18,8 @@ ATTRs are also given, only the DN and the given attributes (if present).
 
 # NOTES
 
-This script requires at least version 0.50 of the Net::LDAP dsitribution 
+This script requires at least version 0.50 of the
+[Net::LDAP](https://github.com/perl-ldap/perl-ldap) distribution
 (i.e. Net::LDAP::FilterMatch version 0.23) and Net::LDAP::DN from
 [https://github.com/vetinari/perl-net-ldap-dn](https://github.com/vetinari/perl-net-ldap-dn).
 
