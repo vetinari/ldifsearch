@@ -414,8 +414,6 @@ it. For OpenLDAP's slapd the I<memberof> module must be loaded (...
 before B<any> I<member> attribute is set) to get the I<memberOf>
 attribute.
 
-B<NOTE>: dynamic groups like I<groupOfURLs> are currenly not supported.
-
 =item --memberof
 
 =item -m

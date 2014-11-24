@@ -71,8 +71,6 @@ it. For OpenLDAP's slapd the _memberof_ module must be loaded (...
 before __any__ _member_ attribute is set) to get the _memberOf_
 attribute.
 
-__NOTE__: dynamic groups like _groupOfURLs_ are currenly not supported.
-
 - \--memberof
 - \-m
 
