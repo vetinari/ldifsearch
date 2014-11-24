@@ -69,8 +69,7 @@ an ldapsearch with `* +` as attribute arguments, the (operational)
 _memberOf_ attribute should be present when your LDAP server supports
 it. For OpenLDAP's slapd the _memberof_ module must be loaded (...
 before __any__ _member_ attribute is set) to get the _memberOf_
-attribute. For an LDIF produced by slapcat, this must be used to query
-the _memberOf_ (or alike referenced attributes/values).
+attribute.
 
 __NOTE__: dynamic groups like _groupOfURLs_ are currenly not supported.
 
@@ -85,8 +84,8 @@ Shortcut for `--ref=groupOfNames,member,memberOf`
 - \-D OC,ATTR,REF\_ATTR,REF\_REF
 
 Add dynamic list support like [slapo-dynlist(5)](http://man.he.net/man5/slapo-dynlist). When called with four
-arguments it will build the REF\_REF attribute in a second run. Example: 
-`--dynlist=groupOfURLs,labeledURI,member,memberOf` will resolve the 
+arguments it will build the REF\_REF attribute in a second run. Example:
+`--dynlist=groupOfURLs,labeledURI,member,memberOf` will resolve the
 query given in the _labeledURI_ in to the _member_ attribute which is
 then resolved to the _memberOf_ attribute (see above for ["--ref"](#--ref)).
 

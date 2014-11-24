@@ -412,8 +412,7 @@ an ldapsearch with C<* +> as attribute arguments, the (operational)
 I<memberOf> attribute should be present when your LDAP server supports
 it. For OpenLDAP's slapd the I<memberof> module must be loaded (...
 before B<any> I<member> attribute is set) to get the I<memberOf>
-attribute. For an LDIF produced by slapcat, this must be used to query
-the I<memberOf> (or alike referenced attributes/values).
+attribute.
 
 B<NOTE>: dynamic groups like I<groupOfURLs> are currenly not supported.
 
@@ -432,8 +431,8 @@ Shortcut for C<--ref=groupOfNames,member,memberOf>
 =item -D OC,ATTR,REF_ATTR,REF_REF
 
 Add dynamic list support like L<slapo-dynlist(5)>. When called with four
-arguments it will build the REF_REF attribute in a second run. Example: 
-C<--dynlist=groupOfURLs,labeledURI,member,memberOf> will resolve the 
+arguments it will build the REF_REF attribute in a second run. Example:
+C<--dynlist=groupOfURLs,labeledURI,member,memberOf> will resolve the
 query given in the I<labeledURI> in to the I<member> attribute which is
 then resolved to the I<memberOf> attribute (see above for L</--ref>).
 
