@@ -1,0 +1,472 @@
+#!/usr/bin/perl
+#
+#
+#
+
+=head1 NAME
+
+ldifsearch - filter entries from an LDIF file
+
+=head1 SYNOPSIS
+
+ ldifsearch -L LDIF [-S SCHEMA_LDIF] \
+        [OPTIONS] [FILTER [ATTR [ATTR [ ... ]]]]
+
+ ldifsearch -L LDIF [-S SCHEMA_LDIF] \
+        [OPTIONS] ldap:///SEARCH_BASE?SCOPE?FILTER?ATTR,ATTR
+
+=head1 DESCRIPTION
+
+ldifsearch searches an LDIF file with the LDAP filter FILTER, similar to
+L<ldapsearch(1)> and writes all matching entries as LDIF to stdout, when
+ATTRs are also given, only the DN and the given attributes (if present).
+
+=head1 NOTES
+
+This script requires at least version 0.50 of the Net::LDAP dsitribution 
+(i.e. Net::LDAP::FilterMatch version 0.23) and Net::LDAP::DN from
+L<https://github.com/vetinari/perl-net-ldap-dn>.
+
+=cut
+
+# more POD at the end ...
+
+use strict;
+use warnings;
+use Getopt::Long;
+use Pod::Usage;
+
+# use lib qw{
+#         ./git/perl-net-ldap-dn/lib
+#         ./git/perl-ldap/lib
+#     };
+use URI;
+
+# core Net::LDAP modules:
+use Net::LDAP::Schema;
+use Net::LDAP::LDIF;
+use Net::LDAP::Filter;
+use Net::LDAP::FilterMatch 0.23;
+# extra:
+use Net::LDAP::DN;
+
+my $ldif_file;
+my $schema_file;
+my $search_base;
+my $memberOf_ref;
+my $dynamicGroup_ref;
+my $attrs_only;
+my @dyn_refs;
+my @refs;
+my $scope;
+my @opts;
+my $size_limit = 0;
+my $verbose;
+
+$0 =~ s#.*/(.*?)#$1#;
+
+sub usage {
+    pod2usage(-exitval => shift, -verbose => 2);
+}
+
+# make -S SCHEMA and -s base different when only
+# one is given...:
+Getopt::Long::Configure('no_ignore_case');
+
+GetOptions(
+        'help|h'        => sub { usage(0); },
+        'ldif|L=s'      => \$ldif_file,
+        'schema|S=s'    => \$schema_file,
+        'base|b=s'      => \$search_base,
+        'scope|s=s'     => \$scope,
+        'memberof|m'    => \$memberOf_ref,
+        'ref|r=s'       => \@refs,
+        'dyngroup|d'    => \$dynamicGroup_ref,
+        'dynlist|D=s'    => \@dyn_refs,
+        'attrs-only|A'  => \$attrs_only,
+        'opt|o=s'       => \@opts,
+        'sizelimit|z=i' => \$size_limit,
+        'verbose|v'     => \$verbose,
+    ) or usage(1);
+my $filter_str  = shift @ARGV || '(objectClass=*)';
+my @attr        = @ARGV;
+if ($filter_str =~ m#^ldap://#) {
+    ($search_base, $scope, $filter_str, @attr) = parse_uri($filter_str);
+}
+
+$Net::LDAP::DN::casefold = 'lower';
+if ($verbose) {
+    warn "$0: Filtering with scope=$scope, base=$search_base\n",
+         "  filter=$filter_str, attr=",join(", ", @attr),"\n";
+}
+
+##### check options ########
+
+die "$0: missing LDIF file\n" unless $ldif_file;
+die "$0: invalid filter\n" unless Net::LDAP::Filter->new($filter_str);
+
+my $schema = undef;
+if ($schema_file) {
+    $schema = Net::LDAP::Schema->new();
+    $schema->parse($schema_file)
+        or die "$0: Failed to parse $schema_file: ",$schema->error,"\n";
+}
+
+if ($memberOf_ref) {
+    push @refs, 'groupOfNames,member,memberOf';
+}
+if ($dynamicGroup_ref) {
+    push @dyn_refs, 'groupOfURLs,labeledURI,member,memberOf';
+}
+
+my %ref_checks = ();
+foreach (@refs) {
+    my ($oc, $attr, $ref) = split /,/, $_;
+    unless ($oc and $attr and $ref) {
+        die "$0: invalid reference str ''$_''\n";
+    }
+    $ref_checks{$oc} = { attribute => $attr, 'reference' => $ref };
+}
+foreach (@dyn_refs) {
+    my ($oc, $attr, $ref, $refref) = split /,/, $_;
+    unless ($oc and $attr) {
+        die "$0: invalid reference str ''$_''\n";
+    }
+    if ($ref and not $refref) {
+        die "$0: --dynlist must have 2 or 4 arguments (separated by a \",\")\n";
+    }
+    $ref_checks{$oc} = { attribute => $attr, 'reference' => $ref, dynamic => 1, 'refref' => $refref };
+}
+
+@attr = () if grep /^\*$/, @attr;
+
+$scope ||= 'sub';
+die "$0: invalid scope $scope\n"
+    unless $scope =~ /^base|one|sub$/;
+
+my %opts = map { (split /=/, $_, 2) } @opts;
+if ($opts{'ldif-wrap'} and $opts{'ldif-wrap'} eq 'no') {
+    $opts{'ldif-wrap'} = 1;
+}
+else {
+    $opts{'ldif-wrap'} = 78;
+}
+
+######## now filter ###########
+
+my %data = parse_ldif($ldif_file, \%ref_checks);
+my $out  = Net::LDAP::LDIF->new(\*STDOUT, "w",
+                                    wrap    => $opts{'ldif-wrap'},
+                                    change  => 0,
+                                    sort    => 1,
+                                );
+my %wanted = map { (lc $_ => 1) } @attr;
+my $num_matched = 0;
+foreach my $entry (search(\%data, $search_base, $scope, $filter_str, @attr)) {
+    if ($attrs_only) {
+        print "dn: ",$entry->dn,"\n"; # FIXME - wrap at $opt{'ldif-wrap'}
+        foreach (sort $entry->attributes) {
+            print "$_: \n";
+        }
+        print "\n";
+    }
+    else {
+        $out->write_entry($entry);
+    }
+
+    if ($size_limit) {
+        last if ++$num_matched == $size_limit;
+    }
+}
+
+sub search {
+    my $data = shift;
+    my ($base, $scope, $filter, @attributes) = @_;
+
+    # warn "SEARCH=$base <=> ",$filter,"\n";
+    @attributes = () if grep /^\*$/, @attributes;
+    my %wanted  = map { (lc($_) => 1) } @attributes;
+    $filter = Net::LDAP::Filter->new($filter);
+    $base   = Net::LDAP::DN->new($base);
+    my @res = ();
+    foreach my $dn (reverse sort map { $_ = $data->{$_}->{dn} } keys %$data) {
+        # warn "CHECK=$dn\n";
+        next unless in_scope($base, $scope, $dn);
+        if ($filter->match($data->{"$dn"}->{entry}, $schema)) {
+            # warn "MATCH=$dn\n";
+            my $entry = $data->{"$dn"}->{entry}->clone();
+            if (@attributes) {
+                foreach (map { lc } $entry->attributes) {
+                    next if $_ eq 'dn';
+                    $entry->delete($_) unless $wanted{$_};
+                }
+            }
+            push @res, $entry;
+        }
+    }
+    # warn "RETURN SEARCH=", scalar(@res), "\n";
+    return @res;
+}
+
+sub in_scope {
+    my $base  = shift;
+    my $scope = shift;
+    my $dn    = shift;
+
+    return 1 unless $base;
+    return 1 if $dn->equal($base); # in base, one and sub
+    return undef if $scope eq 'base';
+    return 1 if ($scope eq 'one' and $dn->parent->equal($base));
+    return 1 if ($scope eq 'sub' and $dn->is_subordinate($base));
+    return undef;
+}
+
+sub parse_uri {
+    my $uri = URI->new(shift);
+    return ($uri->dn, $uri->scope, $uri->filter, $uri->attributes);
+}
+
+sub parse_ldif {
+    # FIXME - first pass: read all entries
+    #       - and build the reverse group membership (slapo-memberof(5))
+    #       - then resolve any dynamic lists (slapo-dynlist(5))
+    #       - and build the reverse group membership (slapo-memberof(5)) in
+    #         case some dynlist gave some results
+    #       - and return the result
+    my $file = shift;
+    my $refs = shift;
+
+    my %hash = ();
+    my $ldif = Net::LDAP::LDIF->new($file, "r", onerror => 'undef');
+
+
+    while (not $ldif->eof()) {
+        my $entry = $ldif->read_entry();
+        if ($ldif->error()) {
+            die "$0: Failed to parse entry: ",$ldif->error(),"\n",
+                "  ERROR:\n",$ldif->error_lines(), "\n";
+        }
+        my $dn = Net::LDAP::DN->new($entry->dn);
+        $hash{"$dn"} = { entry => $entry, dn => $dn };
+    }
+    $ldif->done();
+
+    my @dynamic = resolve(\%hash, $refs, 1);
+    foreach my $item (@dynamic) {
+        my $dn = $item->{dn};
+        # warn "DYN DN=$dn\n";
+        foreach my $val (@{ $item->{value} }) {
+            my ($u_dn, $u_scope, $u_filter, @u_attrs) = parse_uri($val);
+
+            # FIXME - undefined behaviour when @u_attrs = qw/ * /;
+            my @val  = map {
+                            ($u_attrs[0] eq 'dn'
+                                ? $_->dn
+                                : $_->get_value($u_attrs[0]))
+                        } search(\%hash, $u_dn, $u_scope, $u_filter, @u_attrs);
+            my $attr = ($item->{reference}
+                        ? $item->{reference}
+                        : $u_attrs[0]);
+            $hash{$dn}->{entry}->add($attr => \@val);
+
+            # now map the reference stuff to a "non dynamic" in
+            # case we got passed 4 values for --dynlist => i.e.
+            #    reference -> attribute (member)
+            #    refref -> reference    (memberOf)
+            # this is used in the second resolve() below to build e.g. the "memberOf"
+            # attribute for the dynamic groups created with the
+            #    dynlist-attrset groupOfURLs labeledURI member
+            # config in slapd.conf (see slapo-dynlist(5))
+            if ($item->{reference} and $item->{refref}) {
+                $refs->{ $item->{objectClass} }->{attribute} = $item->{reference};
+                $refs->{ $item->{objectClass} }->{reference} = $item->{refref};
+                $refs->{ $item->{objectClass} }->{dynamic}   = undef;
+            }
+        }
+    }
+
+    if (@dynamic) {
+        resolve(\%hash, $refs, undef);
+    }
+
+    # ouch... $entry->add() simply adds without checking duplicates? FIXME is this really
+    # like this?
+    foreach my $dn (keys %hash) {
+        foreach my $attr ($hash{$dn}->{entry}->attributes) {
+            my @val = uniq($hash{$dn}->{entry}->get_value($attr));
+            $hash{$dn}->{entry}->replace($attr => \@val);
+        }
+        $hash{$dn}->{entry}->changetype('modify');
+    }
+    return %hash;
+}
+
+sub uniq {
+    keys %{{ map { ($_ => 1) } @_ }}
+}
+
+sub resolve {
+    my $hash   = shift;
+    my $refs   = shift;
+    my $is_dyn = shift;
+
+    my @dynamic = ();
+    foreach my $dn (keys %$hash) {
+        my $entry = $hash->{$dn}->{entry};
+        foreach my $oc (keys %$refs) {
+            if ($refs->{$oc}->{dynamic}) {
+                next unless $is_dyn;
+            }
+
+            next unless grep /^\Q$oc\E$/i, $entry->get_value('objectClass');
+            my @values = $entry->get_value($refs->{$oc}->{attribute});
+
+            if ($refs->{$oc}->{dynamic}) {
+                push @dynamic, {
+                            dn          => $dn,
+                            value       => \@values,
+                            objectClass => $oc,
+                            reference   => $refs->{$oc}->{reference},
+                            refref      => $refs->{$oc}->{refref},
+                        };
+                        # use Data::Dumper; warn Data::Dumper->Dump([$dynamic[-1]], ['dyn']);
+                next;
+            }
+
+            @values = grep {
+                            $_ ne ""
+                        }
+                        map {
+                            Net::LDAP::DN->new($_)->as_string
+                        }
+                        grep {
+                            !/^\s*$/
+                        } @values;
+            foreach my $value (@values) {
+                # ... FIXME - what to do with invalid entries or entries
+                #     not in this LDIF...
+                if ($hash->{$value}) {
+                    $hash->{$value}->{entry}->add($refs->{$oc}->{reference}, "$dn");
+                }
+                else {
+                    warn "$0: no entry found for $value...\n";
+                }
+            }
+        }
+    }
+    return @dynamic;
+}
+
+=head1 OPTIONS
+
+=over 4
+
+=item --ldif=LDIF
+
+=item -L LDIF
+
+The LDIF file to use.
+
+=item --schema=LDIF
+
+=item -S LDIF
+
+The schema LDIF file to use for matching rules, see L<Net::LDAP::FilterMatch>.
+To retrieve the schema for your LDAP server use:
+
+ perl -MNet::LDAP -MNet::LDAP::Schema \
+    -e 'Net::LDAP->new(shift)->schema()->dump()' $LDAP_URI > schema.ldif
+
+=item --base=BASE
+
+=item -b BASE
+
+Search base for queries, if not given, searches all entries in the LDIF
+file.
+
+=item --scope=SCOPE
+
+=item -s SCOPE
+
+The search scope. One of C<sub>, C<base> or C<one>, defaults to C<sub>.
+
+=item --attrs-only
+
+=item -A
+
+Only print attributes
+
+=item --ref OC,ATTR,REF_ATTR
+
+=item -r OC,ATTR,REF_ATTR
+
+Add references for objectClass OC: the DN of the object will be added as
+attribute REF_ATTR for all DNs referenced by the value of ATTR. Example:
+
+All I<member> of a I<groupOfNames> get a I<memberOf> attribute with the
+DN of the I<groupOfNames> as value.
+
+This option is usually not needed when the LDIF file is the result of
+an ldapsearch with C<* +> as attribute arguments, the (operational)
+I<memberOf> attribute should be present when your LDAP server supports
+it. For OpenLDAP's slapd the I<memberof> module must be loaded (...
+before B<any> I<member> attribute is set) to get the I<memberOf>
+attribute. For an LDIF produced by slapcat, this must be used to query
+the I<memberOf> (or alike referenced attributes/values).
+
+B<NOTE>: dynamic groups like I<groupOfURLs> are currenly not supported.
+
+=item --memberof
+
+=item -m
+
+Shortcut for C<--ref=groupOfNames,member,memberOf>
+
+=item --dynlist OC,ATTR
+
+=item --dynlist OC,ATTR,REF_ATTR,REF_REF
+
+=item -D OC,ATTR
+
+=item -D OC,ATTR,REF_ATTR,REF_REF
+
+Add dynamic list support like L<slapo-dynlist(5)>. When called with four
+arguments it will build the REF_REF attribute in a second run. Example: 
+C<--dynlist=groupOfURLs,labeledURI,member,memberOf> will resolve the 
+query given in the I<labeledURI> in to the I<member> attribute which is
+then resolved to the I<memberOf> attribute (see above for L</--ref>).
+
+=item --dyngroup
+
+=item -d
+
+Shortcut for C<--dynlist=groupOfURLs,labeledURI,member,memberOf>
+
+=item --opt K=V
+
+=item -o K=V
+
+General options.
+
+Only known key is "ldif-wrap", value: "no" or a number, see L<Net::LDAP::LDIF>
+about wrapping long lines
+
+=item --sizelimit=INT
+
+=item -z INT
+
+Return max INT matches.
+
+=back
+
+=head1 SEE ALSO
+
+L<Net::LDAP>, L<Net::LDAP::LDIF>, L<ldapsearch(1)>, L<Net::LDAP::DN>
+
+=head1 AUTHOR
+
+Hanno Hecker E<lt>vetinari@ankh-morp.orgE<gt>
+
+=cut
+
+# vim: ts=4 sw=4 expandtab syn=perl
