@@ -23,6 +23,10 @@ ATTRs are also given, only the DN and the given attributes (if present).
 
 =head1 NOTES
 
+The second argument form of passing an C<ldap://> URI ignores all passed
+I<--base> and I<--scope> options as well as any extra args passed as
+attributes.
+
 This script requires at least version 0.50 of the
 L<Net::LDAP|https://github.com/perl-ldap/perl-ldap> distribution
 (i.e. Net::LDAP::FilterMatch version 0.23) and Net::LDAP::DN from
@@ -83,7 +87,7 @@ GetOptions(
         'memberof|m'    => \$memberOf_ref,
         'ref|r=s'       => \@refs,
         'dyngroup|d'    => \$dynamicGroup_ref,
-        'dynlist|D=s'    => \@dyn_refs,
+        'dynlist|D=s'   => \@dyn_refs,
         'attrs-only|A'  => \$attrs_only,
         'opt|o=s'       => \@opts,
         'sizelimit|z=i' => \$size_limit,
@@ -96,6 +100,7 @@ if ($filter_str =~ m#^ldap://#) {
 }
 
 $Net::LDAP::DN::casefold = 'lower';
+
 if ($verbose) {
     warn "$0: Filtering with scope=$scope, base=$search_base\n",
          "  filter=$filter_str, attr=",join(", ", @attr),"\n";
@@ -136,7 +141,12 @@ foreach (@dyn_refs) {
     if ($ref and not $refref) {
         die "$0: --dynlist must have 2 or 4 arguments (separated by a \",\")\n";
     }
-    $ref_checks{$oc} = { attribute => $attr, 'reference' => $ref, dynamic => 1, 'refref' => $refref };
+    $ref_checks{$oc} = {
+                attribute => $attr,
+                reference => $ref,
+                dynamic   => 1,
+                refref    => $refref,
+            };
 }
 
 @attr = () if grep /^\*$/, @attr;
@@ -155,7 +165,7 @@ else {
 
 ######## now filter ###########
 
-my %data = parse_ldif($ldif_file, \%ref_checks);
+my $data = parse_ldif($ldif_file, \%ref_checks);
 my $out  = Net::LDAP::LDIF->new(\*STDOUT, "w",
                                     wrap    => $opts{'ldif-wrap'},
                                     change  => 0,
@@ -163,7 +173,7 @@ my $out  = Net::LDAP::LDIF->new(\*STDOUT, "w",
                                 );
 my %wanted = map { (lc $_ => 1) } @attr;
 my $num_matched = 0;
-foreach my $entry (search(\%data, $search_base, $scope, $filter_str, @attr)) {
+foreach my $entry (search($data, $search_base, $scope, $filter_str, @attr)) {
     if ($attrs_only) {
         print "dn: ",$entry->dn,"\n"; # FIXME - wrap at $opt{'ldif-wrap'}
         foreach (sort $entry->attributes) {
@@ -190,6 +200,9 @@ sub search {
     $filter = Net::LDAP::Filter->new($filter);
     $base   = Net::LDAP::DN->new($base);
     my @res = ();
+
+    # start with the top of the tree, so we get the top first in the
+    # output LDIF
     foreach my $dn (reverse sort map { $_ = $data->{$_}->{dn} } keys %$data) {
         # warn "CHECK=$dn\n";
         next unless in_scope($base, $scope, $dn);
@@ -227,19 +240,10 @@ sub parse_uri {
     return ($uri->dn, $uri->scope, $uri->filter, $uri->attributes);
 }
 
-sub parse_ldif {
-    # FIXME - first pass: read all entries
-    #       - and build the reverse group membership (slapo-memberof(5))
-    #       - then resolve any dynamic lists (slapo-dynlist(5))
-    #       - and build the reverse group membership (slapo-memberof(5)) in
-    #         case some dynlist gave some results
-    #       - and return the result
+sub read_ldif {
     my $file = shift;
-    my $refs = shift;
-
     my %hash = ();
     my $ldif = Net::LDAP::LDIF->new($file, "r", onerror => 'undef');
-
 
     while (not $ldif->eof()) {
         my $entry = $ldif->read_entry();
@@ -251,55 +255,70 @@ sub parse_ldif {
         $hash{"$dn"} = { entry => $entry, dn => $dn };
     }
     $ldif->done();
+    return \%hash;
+}
 
-    my @dynamic = resolve(\%hash, $refs, 1);
+sub parse_ldif {
+    # - read all entries
+    # - and build the reverse group membership (slapo-memberof(5))
+    # - then resolve any dynamic lists (slapo-dynlist(5))
+    # - and build the reverse group membership (slapo-memberof(5)) in
+    #   case some dynlist gave some results
+    # - and return the result
+    my $file = shift;
+    my $refs = shift;
+
+    my $data    = read_ldif($file);
+
+    my @dynamic = resolve($data, $refs, 1);
     foreach my $item (@dynamic) {
         my $dn = $item->{dn};
-        # warn "DYN DN=$dn\n";
         foreach my $val (@{ $item->{value} }) {
-            my ($u_dn, $u_scope, $u_filter, @u_attrs) = parse_uri($val);
-
-            # FIXME - undefined behaviour when @u_attrs = qw/ * /;
-            my @val  = map {
-                            ($u_attrs[0] eq 'dn'
-                                ? $_->dn
-                                : $_->get_value($u_attrs[0]))
-                        } search(\%hash, $u_dn, $u_scope, $u_filter, @u_attrs);
-            my $attr = ($item->{reference}
-                        ? $item->{reference}
-                        : $u_attrs[0]);
-            $hash{$dn}->{entry}->add($attr => \@val);
-
-            # now map the reference stuff to a "non dynamic" in
-            # case we got passed 4 values for --dynlist => i.e.
-            #    reference -> attribute (member)
-            #    refref -> reference    (memberOf)
-            # this is used in the second resolve() below to build e.g. the "memberOf"
-            # attribute for the dynamic groups created with the
-            #    dynlist-attrset groupOfURLs labeledURI member
-            # config in slapd.conf (see slapo-dynlist(5))
-            if ($item->{reference} and $item->{refref}) {
-                $refs->{ $item->{objectClass} }->{attribute} = $item->{reference};
-                $refs->{ $item->{objectClass} }->{reference} = $item->{refref};
-                $refs->{ $item->{objectClass} }->{dynamic}   = undef;
+            unless ($val =~ m#^ldap://#) {
+                warn "$0: not an ldap uri '$val' in $dn\n";
+                next;
             }
+
+            foreach my $entry (search($data, parse_uri($val))) {
+                if ($item->{reference} and $item->{refref}) {
+                    $data->{$dn}->{entry}->add($item->{reference} => $entry->dn);
+                }
+                else {
+                    $data->{$dn}->{entry}->add(
+                                map { ($_ => [$entry->get_value($_)]) } $entry->attributes
+                            );
+                }
+            }
+        }
+        # now map the reference stuff to a "non dynamic" in
+        # case we got passed 4 values for --dynlist => i.e.
+        #    reference -> attribute (member)
+        #    refref -> reference    (memberOf)
+        # this is used in the second resolve() below to build e.g. the
+        # "memberOf" attribute for the dynamic groups created with the
+        #    dynlist-attrset groupOfURLs labeledURI member
+        # config in slapd.conf (see slapo-dynlist(5))
+        if ($item->{reference} and $item->{refref}) {
+            my $oc = $item->{objectClass};
+            $refs->{$oc}->{attribute} = $item->{reference};
+            $refs->{$oc}->{reference} = $item->{refref};
+            $refs->{$oc}->{dynamic}   = undef;
         }
     }
 
     if (@dynamic) {
-        resolve(\%hash, $refs, undef);
+        resolve($data, $refs, undef);
     }
 
-    # ouch... $entry->add() simply adds without checking duplicates? FIXME is this really
-    # like this?
-    foreach my $dn (keys %hash) {
-        foreach my $attr ($hash{$dn}->{entry}->attributes) {
-            my @val = uniq($hash{$dn}->{entry}->get_value($attr));
-            $hash{$dn}->{entry}->replace($attr => \@val);
+    # ouch... $entry->add() simply adds without checking duplicates?
+    foreach my $dn (keys %$data) {
+        foreach my $attr ($data->{$dn}->{entry}->attributes) {
+            my @val = uniq($data->{$dn}->{entry}->get_value($attr));
+            $data->{$dn}->{entry}->replace($attr => \@val);
         }
-        $hash{$dn}->{entry}->changetype('modify');
+        $data->{$dn}->{entry}->changetype('modify');
     }
-    return %hash;
+    return $data;
 }
 
 sub uniq {
@@ -330,7 +349,6 @@ sub resolve {
                             reference   => $refs->{$oc}->{reference},
                             refref      => $refs->{$oc}->{refref},
                         };
-                        # use Data::Dumper; warn Data::Dumper->Dump([$dynamic[-1]], ['dyn']);
                 next;
             }
 

@@ -18,6 +18,10 @@ ATTRs are also given, only the DN and the given attributes (if present).
 
 # NOTES
 
+The second argument form of passing an `ldap://` URI ignores all passed
+_\--base_ and _\--scope_ options as well as any extra args passed as
+attributes.
+
 This script requires at least version 0.50 of the
 [Net::LDAP](https://github.com/perl-ldap/perl-ldap) distribution
 (i.e. Net::LDAP::FilterMatch version 0.23) and Net::LDAP::DN from
